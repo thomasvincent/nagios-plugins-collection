@@ -2,289 +2,155 @@
 """
 Website Status Check Plugin for Nagios.
 
-This plugin checks the status of a website by sending an HTTP request and
-validating the response. It can check for specific patterns in the response
-content and measure response time.
+This plugin checks the status of a website by making HTTP requests
+and validating response status, response time, and content.
 
 Usage:
-    check_website_status.py --url URL [--pattern PATTERN] [--warning SECONDS]
-                           [--critical SECONDS] [--timeout SECONDS]
-                           [--no-verify-ssl] [--json] [--verbose]
+    check_website_status.py --url URL [--pattern PATTERN] [--timeout SECONDS]
+                          [--warning SECONDS] [--critical SECONDS]
+                          [--json] [--verbose]
 
 Returns:
-    0 (OK): Website is responding correctly within time thresholds
-    1 (WARNING): Website is responding but took longer than warning threshold
-    2 (CRITICAL): Website is not responding or does not match expected pattern
+    0 (OK): Website is responding properly and within thresholds
+    1 (WARNING): Website is responding but response time exceeds warning threshold
+    2 (CRITICAL): Website is not responding or status code is invalid
     3 (UNKNOWN): An unexpected error occurred during the check
 """
 
 import argparse
+import asyncio
 import logging
 import re
 import sys
-from typing import Optional
+from typing import Dict, Optional
 
-import httpx
 from rich.console import Console
-from rich.logging import RichHandler
 
 from nagios_plugins.base import Status, CheckResult
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(message)s",
-    datefmt="[%X]",
-    handlers=[RichHandler(rich_tracebacks=True)],
-)
-logger = logging.getLogger("check_website_status")
+from nagios_plugins.plugin_framework import NagiosPluginFramework
+from nagios_plugins.utils import check_http_endpoint
 
 
-class WebsiteStatusChecker:
-    """Website status checker."""
-
-    def __init__(
-        self,
-        url: str,
-        pattern: Optional[str] = None,
-        timeout: int = 30,
-        verify_ssl: bool = True,
-        warning_threshold: Optional[float] = None,
-        critical_threshold: Optional[float] = None,
-    ):
-        """Initialize the website status checker.
-
-        Args:
-            url: URL to check
-            pattern: Regex pattern to search for in the response
-            timeout: HTTP request timeout in seconds
-            verify_ssl: Whether to verify SSL certificates
-            warning_threshold: Warning threshold in seconds
-            critical_threshold: Critical threshold in seconds
-        """
-        self.url = url
-        self.pattern = re.compile(pattern) if pattern else None
-        self.timeout = timeout
-        self.verify_ssl = verify_ssl
-        self.warning_threshold = warning_threshold
-        self.critical_threshold = critical_threshold
-        self.console = Console()
-
-    async def check_website(self) -> CheckResult:
-        """Check the website status.
+class WebsiteStatusChecker(NagiosPluginFramework):
+    """Website status checker plugin."""
+    
+    def _add_plugin_arguments(self) -> None:
+        """Add plugin-specific arguments."""
+        self.parser.add_argument(
+            "--url",
+            required=True,
+            help="URL of the website to check",
+        )
+        self.parser.add_argument(
+            "--pattern",
+            help="Regex pattern that should be present in the response",
+        )
+        self.parser.add_argument(
+            "--warning",
+            type=float,
+            default=1.0,
+            help="Warning threshold for response time in seconds",
+        )
+        self.parser.add_argument(
+            "--critical",
+            type=float,
+            default=3.0,
+            help="Critical threshold for response time in seconds",
+        )
+        self.parser.add_argument(
+            "--no-verify-ssl",
+            action="store_true",
+            help="Disable SSL certificate verification",
+        )
+    
+    async def check(self) -> CheckResult:
+        """Perform the website status check.
 
         Returns:
             CheckResult with the check result
         """
         try:
-            async with httpx.AsyncClient(
-                timeout=self.timeout, verify=self.verify_ssl, follow_redirects=True
-            ) as client:
-                # Make the request and capture timing information
-                response = await client.get(self.url)
-                duration = response.elapsed.total_seconds()
-
-                # Check HTTP status code
-                if response.status_code >= 400:
-                    return CheckResult(
-                        Status.CRITICAL,
-                        f"HTTP {response.status_code} error",
-                        metrics={"status_code": response.status_code, "duration": duration},
-                        details=f"URL: {self.url}\nResponse: {response.text[:500]}...",
-                    )
-
-                # Check for pattern if specified
-                if self.pattern and not self.pattern.search(response.text):
-                    return CheckResult(
-                        Status.CRITICAL,
-                        f"Pattern not found in response",
-                        metrics={
-                            "status_code": response.status_code,
-                            "duration": duration,
-                            "pattern_found": 0,
-                        },
-                        details=(
-                            f"URL: {self.url}\nPattern: {self.pattern.pattern}\n"
-                            f"Response snippet: {response.text[:500]}..."
-                        ),
-                    )
-
-                # Check response time thresholds
-                status = Status.OK
-                message = "Website OK - response time " + str(round(duration, 2)) + "s"
-
-                if self.critical_threshold and duration > self.critical_threshold:
-                    status = Status.CRITICAL
-                    message = (
-                        f"Response time {duration:.2f}s exceeds critical"
-                        f" threshold {self.critical_threshold}s"
-                    )
-                elif self.warning_threshold and duration > self.warning_threshold:
-                    status = Status.WARNING
-                    message = (
-                        f"Response time {duration:.2f}s exceeds warning"
-                        f" threshold {self.warning_threshold}s"
-                    )
-
-                # Create metrics
-                metrics = {
-                    "status_code": response.status_code,
-                    "duration": duration,
-                }
-
-                if self.pattern:
-                    metrics["pattern_found"] = 1
-
-                # Extract interesting values from response for metrics
-                # Look for key=value or "key": value patterns in the response
-                for pattern in [r"(\w+)=(\w+)", r'"(\w+)":\s*"?([^",]+)"?']:
-                    for match in re.finditer(pattern, response.text):
-                        key, value = match.groups()
-                        # Only include numeric values or boolean-like values
-                        if value.isdigit() or value.lower() in ("true", "false"):
-                            try:
-                                if value.isdigit():
-                                    metrics[key] = int(value)
-                                else:
-                                    metrics[key] = value.lower() == "true"
-                            except (ValueError, TypeError):
-                                pass
-
+            # Normalize URL
+            url = self.args.url
+            if not url.startswith(("http://", "https://")):
+                url = f"http://{url}"
+            
+            self.logger.info(f"Checking website: {url}")
+            
+            # Perform the HTTP check
+            status, message, response_data = await check_http_endpoint(
+                url=url,
+                timeout=self.args.timeout,
+                expected_content=self.args.pattern,
+                verify_ssl=not self.args.no_verify_ssl,
+            )
+            
+            # Extract metrics
+            metrics = {}
+            if response_data and isinstance(response_data, dict):
+                metrics.update(response_data)
+            
+            # Always include response time
+            if "response_time" not in metrics and "response_time_ms" not in metrics:
+                # Try to extract from the message
+                match = re.search(r"(\d+\.\d+)ms", message)
+                if match:
+                    response_time_ms = float(match.group(1))
+                    metrics["response_time_ms"] = response_time_ms
+                    response_time_sec = response_time_ms / 1000.0
+                else:
+                    response_time_sec = 0
+                    
+            # Convert ms to seconds if needed
+            if "response_time_ms" in metrics and "response_time_sec" not in metrics:
+                metrics["response_time_sec"] = metrics["response_time_ms"] / 1000.0
+                response_time_sec = metrics["response_time_sec"]
+            
+            # If there's already a status from the HTTP check, use it
+            if status != Status.OK:
                 return CheckResult(
                     status,
                     message,
                     metrics=metrics,
                 )
-
-        except httpx.TimeoutException:
-            return CheckResult(
-                Status.CRITICAL,
-                f"Request timed out after {self.timeout}s",
-                metrics={"duration": self.timeout},
-                details=f"URL: {self.url}",
-            )
-        except httpx.HTTPError as e:
-            return CheckResult(
-                Status.CRITICAL,
-                f"HTTP error: {str(e)}",
-                metrics={"duration": 0},
-                details=f"URL: {self.url}\nError: {str(e)}",
-            )
+            
+            # Check against thresholds
+            if response_time_sec > self.args.critical:
+                return CheckResult(
+                    Status.CRITICAL,
+                    f"CRITICAL - Response time {response_time_sec:.2f}s exceeds {self.args.critical}s threshold - {url}",
+                    metrics=metrics,
+                )
+            elif response_time_sec > self.args.warning:
+                return CheckResult(
+                    Status.WARNING,
+                    f"WARNING - Response time {response_time_sec:.2f}s exceeds {self.args.warning}s threshold - {url}",
+                    metrics=metrics,
+                )
+            else:
+                return CheckResult(
+                    Status.OK,
+                    f"OK - Website responding in {response_time_sec:.2f}s - {url}",
+                    metrics=metrics,
+                )
+                
         except Exception as e:
-            logger.exception("Unexpected error")
+            self.logger.exception("Error checking website")
             return CheckResult(
                 Status.UNKNOWN,
-                f"Unexpected error: {str(e)}",
-                metrics={"duration": 0},
-                details=f"URL: {self.url}\nError: {str(e)}",
+                f"UNKNOWN - Error checking website: {str(e)}",
+                metrics={"error": 1},
+                details=str(e),
             )
-
-
-def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments.
-
-    Returns:
-        Parsed arguments
-    """
-    parser = argparse.ArgumentParser(
-        description="Check website status",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument(
-        "--url",
-        required=True,
-        help="URL to check",
-    )
-    parser.add_argument(
-        "--pattern",
-        help="Regex pattern to search for in the response",
-    )
-    parser.add_argument(
-        "--warning",
-        type=float,
-        help="Warning threshold for response time in seconds",
-    )
-    parser.add_argument(
-        "--critical",
-        type=float,
-        help="Critical threshold for response time in seconds",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=30,
-        help="HTTP request timeout in seconds",
-    )
-    parser.add_argument(
-        "--no-verify-ssl",
-        action="store_true",
-        help="Disable SSL certificate verification",
-    )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Output in JSON format",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="count",
-        default=0,
-        help="Increase verbosity (can be used multiple times)",
-    )
-
-    return parser.parse_args()
-
-
-async def main_async() -> int:
-    """Main async function.
-
-    Returns:
-        Exit code
-    """
-    args = parse_args()
-
-    # Set logging level based on verbosity
-    if args.verbose == 1:
-        logger.setLevel(logging.INFO)
-    elif args.verbose >= 2:
-        logger.setLevel(logging.DEBUG)
-
-    # Create checker and run check
-    checker = WebsiteStatusChecker(
-        url=args.url,
-        pattern=args.pattern,
-        timeout=args.timeout,
-        verify_ssl=not args.no_verify_ssl,
-        warning_threshold=args.warning,
-        critical_threshold=args.critical,
-    )
-
-    result = await checker.check_website()
-
-    # Output the result
-    if args.json:
-        print(result.to_json())
-    else:
-        print(result)
-
-    return result.status.value
 
 
 def main() -> int:
-    """Main function.
-
-    Returns:
-        Exit code
-    """
-    import asyncio
-
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    return loop.run_until_complete(main_async())
+    """Main function."""
+    plugin = WebsiteStatusChecker(
+        name="check_website_status",
+        description="Check website status and response time",
+    )
+    return plugin.run()
 
 
 if __name__ == "__main__":

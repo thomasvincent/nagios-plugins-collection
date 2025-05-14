@@ -21,6 +21,7 @@ import json
 import logging
 import re
 import sys
+import tempfile
 from typing import Dict, List, Optional
 
 from rich.console import Console
@@ -66,8 +67,12 @@ class MountStatusChecker:
         self.timeout = timeout
         self.console = Console()
 
-        # Add default excludes if not explicitly excluded
-        default_excludes = {"/proc", "/sys", "/dev", "/run", "/tmp", "/var/lib/docker"}
+        # Add default excludes if not explicitly excluded (system and special filesystems)
+        # Instead of hardcoding /tmp, use tempfile.gettempdir() to get the system temp directory
+        import tempfile
+        temp_dir = tempfile.gettempdir()
+        
+        default_excludes = {"/proc", "/sys", "/dev", "/run", temp_dir, "/var/lib/docker"}
         self.exclude_mounts.update(default_excludes)
 
     def _build_command(self) -> List[str]:

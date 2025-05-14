@@ -114,7 +114,7 @@ async def execute_command_async(
             ),
             execution_time=execution_time,
         )
-    except Exception as exc:  # pylint: disable=broad-except
+    except (OSError, asyncio.SubprocessError, ValueError) as exc:
         execution_time = time.time() - start_time
         return CommandResult(
             exit_code=1,
@@ -184,7 +184,7 @@ async def check_tcp_port_async(
         return False, f"Could not resolve hostname: {host}"
     except ConnectionRefusedError:
         return False, f"Connection refused to {host}:{port}"
-    except Exception as e:  # pylint: disable=broad-except
+    except (OSError, ConnectionError, socket.error) as e:
         return False, f"Error checking port {port} on {host}: {str(e)}"
 
 
@@ -295,7 +295,7 @@ async def check_http_endpoint_async(
             f"Request error: {str(e)} - {url} - {response_time:.2f}ms",
             None,
         )
-    except Exception as e:  # pylint: disable=broad-except
+    except (httpx.HTTPError, IOError, ValueError, KeyError) as e:
         elapsed_time = time.time() - start_time
         response_time = elapsed_time * 1000  # Convert to milliseconds
         return (
@@ -453,24 +453,26 @@ def is_process_running(process_name: str) -> bool:
         # Windows
         try:
             result = execute_command(
-                ["tasklist", "/FI", f"IMAGENAME eq {process_name}"],
-                shell=True,
+                ["tasklist", "/FI", f"IMAGENAME eq {process_name}"]
             )
             return process_name.lower() in result.stdout.lower()
-        except Exception:  # pylint: disable=broad-except
+        except (OSError, IOError) as e:
+            console.print(f"[bold red]Error checking process status: {e}[/bold red]")
             return False
     elif system == "Darwin":  # macOS
         try:
             result = execute_command(["pgrep", "-i", process_name])
             return result.success and result.stdout.strip() != ""
-        except Exception:  # pylint: disable=broad-except
+        except (OSError, IOError) as e:
+            console.print(f"[bold red]Error checking process status: {e}[/bold red]")
             return False
     else:
         # Linux and other Unix-like
         try:
             result = execute_command(["pgrep", "-f", process_name])
             return result.success and result.stdout.strip() != ""
-        except Exception:  # pylint: disable=broad-except
+        except (OSError, IOError) as e:
+            console.print(f"[bold red]Error checking process status: {e}[/bold red]")
             return False
 
 
@@ -553,7 +555,7 @@ def get_system_info() -> Dict[str, Any]:
             match = re.search(r"MemFree:\s+(\d+)", meminfo)
             if match:
                 info["free_memory_kb"] = int(match.group(1))
-        except Exception:  # pylint: disable=broad-except
-            pass
+        except (IOError, OSError, FileNotFoundError) as e:
+            console.print(f"[bold yellow]Warning: Could not read system memory info: {e}[/bold yellow]")
 
     return info
